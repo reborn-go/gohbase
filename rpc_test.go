@@ -74,7 +74,7 @@ func TestSendRPCSanity(t *testing.T) {
 	mockCall.EXPECT().ResultChan().Return(result).Times(1)
 	msg, err := c.SendRPC(mockCall)
 	if err != nil {
-		t.Errorf("Unexpected error: %s", err)
+		t.Fatal(err)
 	}
 	if diff := atest.Diff(expMsg, msg); diff != "" {
 		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
@@ -160,7 +160,7 @@ func TestReestablishRegionSplit(t *testing.T) {
 	}
 
 	expRegs := map[string]struct{}{
-		"hbase:meta,,1":                                          struct{}{},
+		"hbase:meta,,1": struct{}{},
 		"test1,,1480547738107.825c5c7e480c76b73d6d2bad5d3f7bb8.": struct{}{},
 	}
 
@@ -368,7 +368,7 @@ func TestEstablishClientConcurrent(t *testing.T) {
 	}
 }
 
-func TestEstablishUnrecoverlableErrorDuringProbe(t *testing.T) {
+func TestEstablishServerErrorDuringProbe(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 	c := newMockClient(nil)
@@ -446,15 +446,17 @@ func TestSendRPCToRegionClientDownDelayed(t *testing.T) {
 		c.clients.put(rc2, origlReg)
 		origlReg.SetClient(rc2)
 
-		// return UnrecoverableError from QueueRPC, to emulate dead client
-		result <- hrpc.RPCResult{Error: region.UnrecoverableError{}}
+		// return ServerError from QueueRPC, to emulate dead client
+		result <- hrpc.RPCResult{Error: region.ServerError{}}
 	})
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		_, err := c.sendRPCToRegion(mockCall, origlReg)
-		if err != ErrRegionUnavailable {
+		switch err.(type) {
+		case region.ServerError, region.NotServingRegionError:
+		default:
 			t.Errorf("Got unexpected error: %v", err)
 		}
 		wg.Done()
@@ -558,7 +560,6 @@ func TestFindRegion(t *testing.T) {
 			},
 			after:     []string{"test,,9999999999999.yoloyoloyoloyoloyoloyoloyoloyolo."},
 			establish: false,
-			err:       ErrRegionUnavailable,
 		},
 		{ // overlapping younger region in cache, passed key is not in that region
 			before: []hrpc.RegionInfo{
@@ -568,7 +569,6 @@ func TestFindRegion(t *testing.T) {
 			},
 			after:     []string{"test,,9999999999999.yoloyoloyoloyoloyoloyoloyoloyolo."},
 			establish: false,
-			err:       ErrRegionUnavailable,
 		},
 	}
 
@@ -641,7 +641,7 @@ func TestFindRegion(t *testing.T) {
 
 }
 
-func TestErrConnotFindRegion(t *testing.T) {
+func TestErrCannotFindRegion(t *testing.T) {
 	c := newMockClient(nil)
 
 	rc, err := region.NewClient(context.Background(), "regionserver:0",
@@ -667,10 +667,10 @@ func TestErrConnotFindRegion(t *testing.T) {
 	}
 	// it should lookup a new older region (1434573235908) that overlaps with the one in cache.
 	// However, it shouldn't be put into cache, as it's older, resulting in a new lookup,
-	// evetually leading to ErrConnotFindRegion.
+	// evetually leading to ErrCannotFindRegion.
 	_, err = c.Get(get)
-	if err != ErrConnotFindRegion {
-		t.Errorf("Expected error %v, got error %v", ErrConnotFindRegion, err)
+	if err != ErrCannotFindRegion {
+		t.Errorf("Expected error %v, got error %v", ErrCannotFindRegion, err)
 	}
 }
 
@@ -757,7 +757,7 @@ func TestConcurrentRetryableError(t *testing.T) {
 		mockCall.EXPECT().SetRegion(origlReg).AnyTimes()
 		mockCall.EXPECT().Context().Return(context.Background()).AnyTimes()
 		result := make(chan hrpc.RPCResult, 1)
-		result <- hrpc.RPCResult{Error: region.RetryableError{}}
+		result <- hrpc.RPCResult{Error: region.NotServingRegionError{}}
 		mockCall.EXPECT().ResultChan().Return(result).AnyTimes()
 		calls[i] = mockCall
 	}
@@ -767,7 +767,7 @@ func TestConcurrentRetryableError(t *testing.T) {
 		wg.Add(1)
 		go func(mockCall hrpc.Call) {
 			_, err := c.sendRPCToRegion(mockCall, origlReg)
-			if err != ErrRegionUnavailable {
+			if _, ok := err.(region.NotServingRegionError); !ok {
 				t.Errorf("Got unexpected error: %v", err)
 			}
 			wg.Done()

@@ -28,9 +28,9 @@ import (
 )
 
 func TestErrors(t *testing.T) {
-	ue := UnrecoverableError{fmt.Errorf("oops")}
-	if ue.Error() != "oops" {
-		t.Errorf("Wrong error message. Got %q, wanted %q", ue, "oops")
+	ue := ServerError{fmt.Errorf("oops")}
+	if ue.Error() != "region.ServerError: oops" {
+		t.Errorf("Wrong error message. Got %q, wanted %q", ue, "region.ServerError: oops")
 	}
 }
 
@@ -276,8 +276,8 @@ func TestProcessRPCsWithFail(t *testing.T) {
 	// check that all calls are not stuck and get an error
 	for _, call := range calls {
 		r := <-call.ResultChan()
-		if r.Error != ErrClientDead {
-			t.Errorf("got unexpected error %v, expected %v", r.Error, ErrClientDead)
+		if r.Error != ErrClientClosed {
+			t.Errorf("got unexpected error %v, expected %v", r.Error, ErrClientClosed)
 		}
 	}
 
@@ -371,14 +371,14 @@ func TestQueueRPC(t *testing.T) {
 			mockCall.EXPECT().ResultChan().Return(result).Times(1)
 			c.QueueRPC(mockCall)
 			r := <-result
-			err, ok := r.Error.(UnrecoverableError)
+			err, ok := r.Error.(ServerError)
 			if !ok {
-				t.Errorf("Expected UnrecoverableError error")
+				t.Errorf("Expected ServerError error")
 				return
 			}
-			if diff := atest.Diff(ErrClientDead.error, err.error); diff != "" {
+			if diff := atest.Diff(ErrClientClosed.error, err.error); diff != "" {
 				t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-					ErrClientDead.error, err.error, diff)
+					ErrClientClosed.error, err.error, diff)
 			}
 		}()
 	}
@@ -386,7 +386,7 @@ func TestQueueRPC(t *testing.T) {
 	wgProcessRPCs.Wait()
 }
 
-func TestUnrecoverableErrorWrite(t *testing.T) {
+func TestServerErrorWrite(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
@@ -418,7 +418,7 @@ func TestUnrecoverableErrorWrite(t *testing.T) {
 	// check that processRPCs exists
 	c.processRPCs()
 	r := <-result
-	if diff := atest.Diff(ErrClientDead.Error(), r.Error.Error()); diff != "" {
+	if diff := atest.Diff(ErrClientClosed.Error(), r.Error.Error()); diff != "" {
 		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
 			expErr, r.Error, diff)
 	}
@@ -427,7 +427,7 @@ func TestUnrecoverableErrorWrite(t *testing.T) {
 	}
 }
 
-func TestUnrecoverableErrorRead(t *testing.T) {
+func TestServerErrorRead(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
@@ -463,13 +463,13 @@ func TestUnrecoverableErrorRead(t *testing.T) {
 		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
 	}
 	r := <-result
-	if diff := atest.Diff(ErrClientDead.Error(), r.Error.Error()); diff != "" {
+	if diff := atest.Diff(ErrClientClosed.Error(), r.Error.Error()); diff != "" {
 		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-			ErrClientDead, r.Error, diff)
+			ErrClientClosed, r.Error, diff)
 	}
 }
 
-func TestUnrecoverableExceptionResponse(t *testing.T) {
+func TestServerErrorExceptionResponse(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 	mockConn := mock.NewMockConn(ctrl)
@@ -518,9 +518,9 @@ func TestUnrecoverableExceptionResponse(t *testing.T) {
 		"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException", "ooops")
 
 	err = c.receive()
-	if _, ok := err.(UnrecoverableError); !ok {
+	if _, ok := err.(ServerError); !ok {
 		if err.Error() != expErr.Error() {
-			t.Fatalf("expected UnrecoverableError with message %q, got %T: %v", expErr, err, err)
+			t.Fatalf("expected ServerError with message %q, got %T: %v", expErr, err, err)
 		}
 	}
 
@@ -560,7 +560,8 @@ func TestReceiveDecodeProtobufError(t *testing.T) {
 		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
 	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
 	expError := errors.New(
-		"failed to decode the response: proto: pb.MutateResponse: illegal tag 0 (wire type 0)")
+		"region.RetryableError: failed to decode the response: " +
+			"proto: pb.MutateResponse: illegal tag 0 (wire type 0)")
 
 	err := c.receive()
 	if err == nil || err.Error() != expError.Error() {
@@ -608,7 +609,7 @@ func TestReceiveDeserializeCellblocksError(t *testing.T) {
 	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
 		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
 	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
-	expError := errors.New("failed to decode the response: OOPS")
+	expError := errors.New("region.RetryableError: failed to decode the response: OOPS")
 
 	err := c.receive()
 	if err == nil || err.Error() != expError.Error() {
