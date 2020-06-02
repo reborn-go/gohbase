@@ -3,8 +3,6 @@
 // Use of this source code is governed by the Apache License 2.0
 // that can be found in the COPYING file.
 
-// +build testing,!integration
-
 package gohbase
 
 import (
@@ -12,30 +10,35 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
-	"golang.org/x/time/rate"
-
-	atest "github.com/aristanetworks/goarista/test"
-	"github.com/cznic/b"
 	"github.com/golang/mock/gomock"
-	"github.com/reborn-go/gohbase/hrpc"
-	"github.com/reborn-go/gohbase/pb"
-	"github.com/reborn-go/gohbase/region"
-	"github.com/reborn-go/gohbase/test"
-	"github.com/reborn-go/gohbase/test/mock"
-	mockRegion "github.com/reborn-go/gohbase/test/mock/region"
-	mockZk "github.com/reborn-go/gohbase/test/mock/zk"
-	"github.com/reborn-go/gohbase/zk"
+	"github.com/tsuna/gohbase/hrpc"
+	"github.com/tsuna/gohbase/pb"
+	"github.com/tsuna/gohbase/region"
+	"github.com/tsuna/gohbase/test"
+	"github.com/tsuna/gohbase/test/mock"
+	mockRegion "github.com/tsuna/gohbase/test/mock/region"
+	mockZk "github.com/tsuna/gohbase/test/mock/zk"
+	"github.com/tsuna/gohbase/zk"
+	"google.golang.org/protobuf/proto"
+	"modernc.org/b"
 )
+
+func newRegionClientFn(addr string) func() hrpc.RegionClient {
+	return func() hrpc.RegionClient {
+		return newMockRegionClient(addr, region.RegionClient,
+			0, 0, "root", region.DefaultReadTimeout)
+	}
+}
 
 func newMockClient(zkClient zk.Client) *client {
 	return &client{
-		clientType: standardClient,
+		clientType: region.RegionClient,
 		regions:    keyRegionCache{regions: b.TreeNew(region.CompareGeneric)},
 		clients: clientRegionCache{
 			regions: make(map[hrpc.RegionClient]map[hrpc.RegionInfo]struct{}),
@@ -46,9 +49,9 @@ func newMockClient(zkClient zk.Client) *client {
 			[]byte("hbase:meta,,1"), nil, nil),
 		zkTimeout:           defaultZkTimeout,
 		zkClient:            zkClient,
-		metaLookupLimiter:   rate.NewLimiter(metaLimit, metaBurst),
 		regionLookupTimeout: region.DefaultLookupTimeout,
 		regionReadTimeout:   region.DefaultReadTimeout,
+		newRegionClientFn:   newMockRegionClient,
 	}
 }
 
@@ -74,11 +77,10 @@ func TestSendRPCSanity(t *testing.T) {
 	mockCall.EXPECT().ResultChan().Return(result).Times(1)
 	msg, err := c.SendRPC(mockCall)
 	if err != nil {
-		t.Errorf("Unexpected error: %s", err)
+		t.Fatal(err)
 	}
-	if diff := atest.Diff(expMsg, msg); diff != "" {
-		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-			expMsg, msg, diff)
+	if !proto.Equal(expMsg, msg) {
+		t.Errorf("expected %v, got %v", expMsg, msg)
 	}
 
 	if len(c.clients.regions) != 2 {
@@ -137,21 +139,20 @@ func TestReestablishRegionSplit(t *testing.T) {
 		nil,
 		nil,
 	)
-	rc1, err := region.NewClient(
-		context.Background(), "regionserver:1", region.RegionClient,
-		0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
+
 	// pretend regionserver:1 has meta table
-	c.metaRegionInfo.SetClient(rc1)
 	// "test1" is at the moment at regionserver:1
-	origlReg.SetClient(rc1)
 	// marking unavailable to simulate error
 	origlReg.MarkUnavailable()
+	rc1 := c.clients.put("regionserver:1", origlReg, newRegionClientFn("regionserver:1"))
+	origlReg.SetClient(rc1)
 	c.regions.put(origlReg)
-	c.clients.put(rc1, origlReg)
-	c.clients.put(rc1, c.metaRegionInfo)
+
+	rc2 := c.clients.put("regionserver:1", c.metaRegionInfo, newRegionClientFn("regionserver:1"))
+	if rc1 != rc2 {
+		t.Fatal("expected to get the same region client")
+	}
+	c.metaRegionInfo.SetClient(rc2)
 
 	c.reestablishRegion(origlReg)
 
@@ -160,7 +161,7 @@ func TestReestablishRegionSplit(t *testing.T) {
 	}
 
 	expRegs := map[string]struct{}{
-		"hbase:meta,,1":                                          struct{}{},
+		"hbase:meta,,1": struct{}{},
 		"test1,,1480547738107.825c5c7e480c76b73d6d2bad5d3f7bb8.": struct{}{},
 	}
 
@@ -181,9 +182,8 @@ func TestReestablishRegionSplit(t *testing.T) {
 					r.Client().Addr(), rc1.Addr())
 			}
 		}
-		if diff := atest.Diff(expRegs, gotRegs); diff != "" {
-			t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-				expRegs, gotRegs, diff)
+		if !reflect.DeepEqual(expRegs, gotRegs) {
+			t.Errorf("expected %v, got %v", expRegs, gotRegs)
 		}
 
 		// check that we still have the same client that we injected
@@ -225,63 +225,21 @@ func TestReestablishRegionSplit(t *testing.T) {
 	}
 }
 
-func TestThrottleRegionLookups(t *testing.T) {
-	t.Skip("throttling is broken")
-	ctrl := test.NewController(t)
-	defer ctrl.Finish()
-	c := newMockClient(nil)
-	numOK := int32(0)
-
-	rc := mockRegion.NewMockRegionClient(ctrl)
-	rc.EXPECT().String().Return("mock region client").AnyTimes()
-	rc.EXPECT().QueueRPC(gomock.Any()).AnyTimes().Do(func(rpc hrpc.Call) {
-		atomic.AddInt32(&numOK, 1)
-		rpc.ResultChan() <- hrpc.RPCResult{}
-	})
-	c.metaRegionInfo.SetClient(rc)
-	c.clients.put(rc, c.metaRegionInfo)
-	ctx := context.Background()
-	table, key := []byte("yolo"), []byte("swag")
-
-	start := time.Now()
-	end := start.Add(time.Second)
-	var wg sync.WaitGroup
-	for time.Now().Before(end) {
-		wg.Add(1)
-		go func() {
-			c.metaLookup(ctx, table, key)
-			wg.Done()
-		}()
-		// this will offer ~2,000 requests per second
-		// while we only allow 100 request per 100 milliseconds
-		time.Sleep(500 * time.Microsecond)
-	}
-	wg.Wait()
-	elapsed := time.Since(start)
-	ideal := 1 + (100 * float64(elapsed) / float64(100*time.Millisecond))
-
-	// We should never get more requests than allowed.
-	if want := int32(ideal + 1); numOK > want {
-		t.Errorf("numOK = %d, want %d (ideal %f)", numOK, want, ideal)
-	}
-}
-
 func TestReestablishRegionNSRE(t *testing.T) {
 	c := newMockClient(nil)
 	origlReg := region.NewInfo(0, nil, []byte("nsre"),
 		[]byte("nsre,,1434573235908.56f833d5569a27c7a43fbf547b4924a4."), nil, nil)
 	// inject a fake regionserver client and fake region into cache
-	rc1, err := region.NewClient(context.Background(), "regionserver:1", region.RegionClient,
-		0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// pretend regionserver:1 has meta table
-	c.metaRegionInfo.SetClient(rc1)
-	c.clients.put(rc1, c.metaRegionInfo)
+	rc1 := c.clients.put("regionserver:1", c.metaRegionInfo, newRegionClientFn("regionserver:1"))
+	rc2 := c.clients.put("regionserver:1", origlReg, newRegionClientFn("regionserver:1"))
+	if rc1 != rc2 {
+		t.Fatal("expected region client to be the same")
+	}
+
 	// "nsre" is at the moment at regionserver:1
+	c.metaRegionInfo.SetClient(rc1)
 	origlReg.SetClient(rc1)
-	c.clients.put(rc1, origlReg)
 	// marking unavailable to simulate error
 	origlReg.MarkUnavailable()
 	c.regions.put(origlReg)
@@ -312,6 +270,62 @@ func TestReestablishRegionNSRE(t *testing.T) {
 
 	if origlReg.Client() != rc1 {
 		t.Error("Expected original region the same client")
+	}
+}
+
+func TestEstablishRegionDialFail(t *testing.T) {
+	ctrl := test.NewController(t)
+	defer ctrl.Finish()
+
+	c := newMockClient(nil)
+
+	rcFailDial := mockRegion.NewMockRegionClient(ctrl)
+	// return an error to make sure we lookup an new client
+	rcFailDial.EXPECT().Dial(gomock.Any()).Return(errors.New("ooops")).AnyTimes()
+	rcFailDial.EXPECT().Addr().Return("regionserver:1").AnyTimes()
+	rcFailDial.EXPECT().String().Return("regionserver:1").AnyTimes()
+
+	// second client returns that region has been dead
+	// this is a success case to make sure we ever obtain a new client and not
+	// just stuck looking up in cache
+	rcDialCancel := mockRegion.NewMockRegionClient(ctrl)
+	rcDialCancel.EXPECT().Dial(gomock.Any()).Return(context.Canceled)
+	rcDialCancel.EXPECT().Addr().Return("regionserver:1").AnyTimes()
+	rcDialCancel.EXPECT().String().Return("reginserver:1").AnyTimes()
+
+	newRegionClientFnCallCount := 0
+	c.newRegionClientFn = func(_ string, _ region.ClientType, _ int, _ time.Duration,
+		_ string, _ time.Duration) hrpc.RegionClient {
+		var rc hrpc.RegionClient
+		if newRegionClientFnCallCount == 0 {
+			rc = rcFailDial
+		} else {
+			// if there was a bug with cache updates, we would never get into this case
+			rc = rcDialCancel
+		}
+		newRegionClientFnCallCount++
+		return rc
+	}
+
+	reg := region.NewInfo(
+		0, nil, []byte("test1"), []byte("test1,,1434573235908.56f833d5569a27c7a43fbf547b4924a4."),
+		nil, nil)
+	reg.MarkUnavailable()
+
+	// inject a fake regionserver client and fake region into cache
+	// pretend regionserver:0 has meta table
+	rc1 := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
+	c.metaRegionInfo.SetClient(rc1)
+
+	// should get stuck if the region is never established
+	c.establishRegion(reg, "regionserver:1")
+
+	if len(c.clients.regions) != 2 {
+		t.Errorf("Expected 2 clients in cache, got %d", len(c.clients.regions))
+	}
+
+	if reg.IsUnavailable() {
+		t.Error("Expected region to be available")
 	}
 }
 
@@ -368,21 +382,14 @@ func TestEstablishClientConcurrent(t *testing.T) {
 	}
 }
 
-func TestEstablishUnrecoverlableErrorDuringProbe(t *testing.T) {
+func TestEstablishServerErrorDuringProbe(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 	c := newMockClient(nil)
 
-	rc, err := region.NewClient(
-		context.Background(), "regionserver:0", region.RegionClient,
-		0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// pretend regionserver:0 has meta table
+	rc := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
 	c.metaRegionInfo.SetClient(rc)
-	c.clients.put(rc, c.metaRegionInfo)
 
 	mockCall := mock.NewMockCall(ctrl)
 	mockCall.EXPECT().Context().Return(context.Background()).AnyTimes()
@@ -398,9 +405,9 @@ func TestEstablishUnrecoverlableErrorDuringProbe(t *testing.T) {
 	if err != nil {
 		t.Errorf("Unexpected error: %s", err)
 	}
-	if diff := atest.Diff(expMsg, msg); diff != "" {
-		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-			expMsg, msg, diff)
+
+	if !proto.Equal(expMsg, msg) {
+		t.Errorf("expected %v, got %v", expMsg, msg)
 	}
 
 	if len(c.clients.regions) != 2 {
@@ -423,11 +430,13 @@ func TestSendRPCToRegionClientDownDelayed(t *testing.T) {
 		0, nil, []byte("test1"),
 		[]byte("test1,,1234567890042.56f833d5569a27c7a43fbf547b4924a4."),
 		nil, nil)
+	c.regions.put(origlReg)
 	rc := mockRegion.NewMockRegionClient(ctrl)
 	rc.EXPECT().String().Return("mock region client").AnyTimes()
+	c.clients.put("regionserver:0", origlReg, func() hrpc.RegionClient {
+		return rc
+	})
 	origlReg.SetClient(rc)
-	c.regions.put(origlReg)
-	c.clients.put(rc, origlReg)
 
 	mockCall := mock.NewMockCall(ctrl)
 	mockCall.EXPECT().SetRegion(origlReg).Times(1)
@@ -443,18 +452,22 @@ func TestSendRPCToRegionClientDownDelayed(t *testing.T) {
 		// replace client in region with new client
 		// this simulate other rpc toggling client reestablishment
 		c.regions.put(origlReg)
-		c.clients.put(rc2, origlReg)
+		c.clients.put("regionserver:0", origlReg, func() hrpc.RegionClient {
+			return rc2
+		})
 		origlReg.SetClient(rc2)
 
-		// return UnrecoverableError from QueueRPC, to emulate dead client
-		result <- hrpc.RPCResult{Error: region.UnrecoverableError{}}
+		// return ServerError from QueueRPC, to emulate dead client
+		result <- hrpc.RPCResult{Error: region.ServerError{}}
 	})
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		_, err := c.sendRPCToRegion(mockCall, origlReg)
-		if err != ErrRegionUnavailable {
+		switch err.(type) {
+		case region.ServerError, region.NotServingRegionError:
+		default:
 			t.Errorf("Got unexpected error: %v", err)
 		}
 		wg.Done()
@@ -478,12 +491,6 @@ func TestReestablishDeadRegion(t *testing.T) {
 	// setting zookeeper client to nil because we don't
 	// expect for it to be called
 	c := newMockClient(nil)
-	rc1, err := region.NewClient(
-		context.Background(), "regionserver:0", region.RegionClient,
-		0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// here we assume that this region was removed from
 	// regions cache and thereby is considered dead
 	reg := region.NewInfo(
@@ -494,10 +501,11 @@ func TestReestablishDeadRegion(t *testing.T) {
 		nil, nil)
 	reg.MarkDead()
 
+	rc1 := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
+	c.clients.put("regionserver:0", reg, newRegionClientFn("regionserver:0"))
+
 	// pretend regionserver:0 has meta table
 	c.metaRegionInfo.SetClient(rc1)
-	c.clients.put(rc1, c.metaRegionInfo)
-	c.clients.put(rc1, reg)
 
 	reg.MarkUnavailable()
 
@@ -558,7 +566,6 @@ func TestFindRegion(t *testing.T) {
 			},
 			after:     []string{"test,,9999999999999.yoloyoloyoloyoloyoloyoloyoloyolo."},
 			establish: false,
-			err:       ErrRegionUnavailable,
 		},
 		{ // overlapping younger region in cache, passed key is not in that region
 			before: []hrpc.RegionInfo{
@@ -568,7 +575,6 @@ func TestFindRegion(t *testing.T) {
 			},
 			after:     []string{"test,,9999999999999.yoloyoloyoloyoloyoloyoloyoloyolo."},
 			establish: false,
-			err:       ErrRegionUnavailable,
 		},
 	}
 
@@ -577,15 +583,9 @@ func TestFindRegion(t *testing.T) {
 	// setting zookeeper client to nil because we don't
 	// expect for it to be called
 	c := newMockClient(nil)
-	rc, err := region.NewClient(
-		context.Background(), "regionserver:0", region.RegionClient,
-		0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// pretend regionserver:0 has meta table
+	rc := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
 	c.metaRegionInfo.SetClient(rc)
-	c.clients.put(rc, c.metaRegionInfo)
 
 	ctx := context.Background()
 	testTable := []byte("test")
@@ -641,23 +641,18 @@ func TestFindRegion(t *testing.T) {
 
 }
 
-func TestErrConnotFindRegion(t *testing.T) {
+func TestErrCannotFindRegion(t *testing.T) {
 	c := newMockClient(nil)
 
-	rc, err := region.NewClient(context.Background(), "regionserver:0",
-		region.RegionClient, 0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// pretend regionserver:0 has meta table
+	rc := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
 	c.metaRegionInfo.SetClient(rc)
-	c.clients.put(rc, c.metaRegionInfo)
 
 	// add young and small region to cache
 	origlReg := region.NewInfo(1434573235910, nil, []byte("test"),
 		[]byte("test,yolo,1434573235910.56f833d5569a27c7a43fbf547b4924a4."), []byte("yolo"), nil)
 	c.regions.put(origlReg)
-	c.clients.put(rc, origlReg)
+	rc = c.clients.put("regionserver:0", origlReg, newRegionClientFn("regionserver:0"))
 	origlReg.SetClient(rc)
 
 	// request a key not in the "yolo" region.
@@ -667,26 +662,20 @@ func TestErrConnotFindRegion(t *testing.T) {
 	}
 	// it should lookup a new older region (1434573235908) that overlaps with the one in cache.
 	// However, it shouldn't be put into cache, as it's older, resulting in a new lookup,
-	// evetually leading to ErrConnotFindRegion.
+	// evetually leading to ErrCannotFindRegion.
 	_, err = c.Get(get)
-	if err != ErrConnotFindRegion {
-		t.Errorf("Expected error %v, got error %v", ErrConnotFindRegion, err)
+	if err != ErrCannotFindRegion {
+		t.Errorf("Expected error %v, got error %v", ErrCannotFindRegion, err)
 	}
 }
 
 func TestMetaLookupTableNotFound(t *testing.T) {
 	c := newMockClient(nil)
-
-	rc, err := region.NewClient(context.Background(), "regionserver:0",
-		region.RegionClient, 0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// pretend regionserver:0 has meta table
+	rc := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
 	c.metaRegionInfo.SetClient(rc)
-	c.clients.put(rc, c.metaRegionInfo)
 
-	_, _, err = c.metaLookup(context.Background(), []byte("tablenotfound"), []byte(t.Name()))
+	_, _, err := c.metaLookup(context.Background(), []byte("tablenotfound"), []byte(t.Name()))
 	if err != TableNotFound {
 		t.Errorf("Expected error %v, got error %v", TableNotFound, err)
 	}
@@ -694,19 +683,13 @@ func TestMetaLookupTableNotFound(t *testing.T) {
 
 func TestMetaLookupCanceledContext(t *testing.T) {
 	c := newMockClient(nil)
-
-	rc, err := region.NewClient(context.Background(), "regionserver:0",
-		region.RegionClient, 0, 0, "root", region.DefaultReadTimeout)
-	if err != nil {
-		t.Fatal(err)
-	}
 	// pretend regionserver:0 has meta table
+	rc := c.clients.put("regionserver:0", c.metaRegionInfo, newRegionClientFn("regionserver:0"))
 	c.metaRegionInfo.SetClient(rc)
-	c.clients.put(rc, c.metaRegionInfo)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, _, err = c.metaLookup(ctx, []byte("tablenotfound"), []byte(t.Name()))
+	_, _, err := c.metaLookup(ctx, []byte("tablenotfound"), []byte(t.Name()))
 	if err != context.Canceled {
 		t.Errorf("Expected error %v, got error %v", context.Canceled, err)
 	}
@@ -738,15 +721,19 @@ func TestConcurrentRetryableError(t *testing.T) {
 		nil,
 		nil,
 	)
+
 	rc := mockRegion.NewMockRegionClient(ctrl)
 	rc.EXPECT().String().Return("mock region client").AnyTimes()
 	rc.EXPECT().Addr().Return("host:1234").AnyTimes()
-	origlReg.SetClient(rc)
-	whateverRegion.SetClient(rc)
+	newRC := func() hrpc.RegionClient {
+		return rc
+	}
 	c.regions.put(origlReg)
 	c.regions.put(whateverRegion)
-	c.clients.put(rc, origlReg)
-	c.clients.put(rc, whateverRegion)
+	c.clients.put("host:1234", origlReg, newRC)
+	c.clients.put("host:1234", whateverRegion, newRC)
+	origlReg.SetClient(rc)
+	whateverRegion.SetClient(rc)
 
 	numCalls := 100
 	rc.EXPECT().QueueRPC(gomock.Any()).MinTimes(1)
@@ -757,7 +744,7 @@ func TestConcurrentRetryableError(t *testing.T) {
 		mockCall.EXPECT().SetRegion(origlReg).AnyTimes()
 		mockCall.EXPECT().Context().Return(context.Background()).AnyTimes()
 		result := make(chan hrpc.RPCResult, 1)
-		result <- hrpc.RPCResult{Error: region.RetryableError{}}
+		result <- hrpc.RPCResult{Error: region.NotServingRegionError{}}
 		mockCall.EXPECT().ResultChan().Return(result).AnyTimes()
 		calls[i] = mockCall
 	}
@@ -767,7 +754,7 @@ func TestConcurrentRetryableError(t *testing.T) {
 		wg.Add(1)
 		go func(mockCall hrpc.Call) {
 			_, err := c.sendRPCToRegion(mockCall, origlReg)
-			if err != ErrRegionUnavailable {
+			if _, ok := err.(region.NotServingRegionError); !ok {
 				t.Errorf("Got unexpected error: %v", err)
 			}
 			wg.Done()

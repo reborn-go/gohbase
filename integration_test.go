@@ -10,12 +10,12 @@ package gohbase_test
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,18 +24,21 @@ import (
 
 	"math"
 
-	atest "github.com/aristanetworks/goarista/test"
-	"github.com/golang/protobuf/proto"
-	"github.com/reborn-go/gohbase"
-	"github.com/reborn-go/gohbase/filter"
-	"github.com/reborn-go/gohbase/hrpc"
-	"github.com/reborn-go/gohbase/pb"
 	log "github.com/sirupsen/logrus"
+	"github.com/tsuna/gohbase"
+	"github.com/tsuna/gohbase/filter"
+	"github.com/tsuna/gohbase/hrpc"
+	"github.com/tsuna/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 var host = flag.String("host", "localhost", "The location where HBase is running")
 
-const table = "test1"
+var table string
+
+func init() {
+	table = fmt.Sprintf("gohbase_test_%d", time.Now().UnixNano())
+}
 
 // CreateTable creates the given table with the given families
 func CreateTable(client gohbase.AdminClient, table string, cFamilies []string) error {
@@ -711,7 +714,7 @@ func TestDelete(t *testing.T) {
 			in: func(key string) (*hrpc.Mutate, error) {
 				return hrpc.NewDelStr(context.Background(), table, key, nil)
 			},
-			out: []*hrpc.Cell{},
+			out: nil,
 		},
 		{
 			// delete the whole row at ts
@@ -800,8 +803,8 @@ func TestDelete(t *testing.T) {
 				c.CellType = pb.CellType_PUT.Enum()
 			}
 
-			if d := atest.Diff(tcase.out, rsp.Cells); d != "" {
-				t.Fatalf("unexpected cells: %s", d)
+			if !reflect.DeepEqual(tcase.out, rsp.Cells) {
+				t.Fatalf("expected %v, got %v", tcase.out, rsp.Cells)
 			}
 		})
 	}
@@ -1195,136 +1198,6 @@ func TestIncrementParallel(t *testing.T) {
 	}
 }
 
-func TestIncrementMultiColumn(t *testing.T) {
-	c := gohbase.NewClient(*host)
-	defer c.Close()
-	key := "row103"
-
-	converseFun := func(result *hrpc.Result) map[string]map[string]uint64 {
-		resultsValues := make(map[string]map[string]uint64)
-		for _, cell := range result.Cells {
-			cf := string(cell.Family)
-			col := string(cell.Qualifier)
-			if _, exist := resultsValues[cf]; !exist {
-				resultsValues[cf] = make(map[string]uint64)
-			}
-			val := binary.BigEndian.Uint64(cell.Value)
-			resultsValues[cf][col] = uint64(val)
-		}
-		return resultsValues
-	}
-
-	buf1 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf1, uint64(1))
-
-	buf2 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf2, uint64(1))
-
-	values := map[string]map[string][]byte{"cf": map[string][]byte{"a": buf1, "b": buf2}}
-
-	// test incrementMultiColumn
-	incRequest, err := hrpc.NewIncStr(context.Background(), table, key, values)
-	result, err := c.IncrementMultiColumn(incRequest)
-	if err != nil {
-		t.Fatalf("Increment returned an error: %v", err)
-	}
-
-	resultsValues := converseFun(result)
-
-	if len(resultsValues["cf"]) != 2 {
-		t.Fatalf("Len of IncrementMultiColumn's result is %d, want 2", len(resultsValues["cf"]))
-	}
-
-	if resultsValues["cf"]["a"] != 1 {
-		t.Fatalf("IncrementMultiColumn's result is %d, want 1", resultsValues["cf"]["a"])
-	}
-	if resultsValues["cf"]["b"] != 1 {
-		t.Fatalf("IncrementMultiColumn's result is %d, want 1", resultsValues["cf"]["b"])
-	}
-
-	binary.BigEndian.PutUint64(buf1, uint64(5))
-	binary.BigEndian.PutUint64(buf2, uint64(5))
-	values = map[string]map[string][]byte{"cf": map[string][]byte{"a": buf1, "b": buf2}}
-
-	incRequest, err = hrpc.NewIncStr(context.Background(), table, key, values)
-	result, err = c.IncrementMultiColumn(incRequest)
-	if err != nil {
-		t.Fatalf("IncrementMultiColumn returned an error: %v", err)
-	}
-
-	resultsValues = converseFun(result)
-
-	if resultsValues["cf"]["a"] != 6 {
-		t.Fatalf("IncrementMultiColumn's result is %d, want 1", resultsValues["cf"]["a"])
-	}
-	if resultsValues["cf"]["b"] != 6 {
-		t.Fatalf("IncrementMultiColumn's result is %d, want 1", resultsValues["cf"]["b"])
-	}
-}
-
-func TestIncrementMultiColumnParallel(t *testing.T) {
-	c := gohbase.NewClient(*host)
-	defer c.Close()
-	key := "row103.5"
-
-	numParallel := 10
-
-	converseFun := func(result *hrpc.Result) map[string]map[string]uint64 {
-		resultsValues := make(map[string]map[string]uint64)
-		for _, cell := range result.Cells {
-			cf := string(cell.Family)
-			col := string(cell.Qualifier)
-			if _, exist := resultsValues[cf]; !exist {
-				resultsValues[cf] = make(map[string]uint64)
-			}
-			val := binary.BigEndian.Uint64(cell.Value)
-			resultsValues[cf][col] = uint64(val)
-		}
-		return resultsValues
-	}
-
-	// test incrementMultiColumn
-	var wg sync.WaitGroup
-	for i := 0; i < numParallel; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			buf1 := make([]byte, 8)
-			binary.BigEndian.PutUint64(buf1, uint64(1))
-			buf2 := make([]byte, 8)
-			binary.BigEndian.PutUint64(buf2, uint64(1))
-			values := map[string]map[string][]byte{"cf": map[string][]byte{"a": buf1, "b": buf2}}
-			incRequest, err := hrpc.NewIncStr(context.Background(), table, key, values)
-			_, err = c.IncrementMultiColumn(incRequest)
-			if err != nil {
-				t.Errorf("IncrementMultiColumn returned an error: %v", err)
-			}
-		}()
-	}
-	wg.Wait()
-
-	// do one more to check if there's a correct value
-	buf1 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf1, uint64(1))
-	buf2 := make([]byte, 8)
-	binary.BigEndian.PutUint64(buf2, uint64(1))
-	values := map[string]map[string][]byte{"cf": map[string][]byte{"a": buf1, "b": buf2}}
-	incRequest, err := hrpc.NewIncStr(context.Background(), table, key, values)
-	result, err := c.IncrementMultiColumn(incRequest)
-	if err != nil {
-		t.Fatalf("IncrementMultiColumn returned an error: %v", err)
-	}
-
-	resultsValues := converseFun(result)
-
-	if resultsValues["cf"]["a"] != uint64(numParallel+1) {
-		t.Fatalf("IncrementMultiColumn's result is %d, want 1", resultsValues["cf"]["a"])
-	}
-	if resultsValues["cf"]["b"] != uint64(numParallel+1) {
-		t.Fatalf("IncrementMultiColumn's result is %d, want 1", resultsValues["cf"]["b"])
-	}
-}
-
 func TestCheckAndPut(t *testing.T) {
 	c := gohbase.NewClient(*host)
 	defer c.Close()
@@ -1563,6 +1436,18 @@ func insertKeyValue(c gohbase.Client, key, columnFamily string, value []byte,
 		return err
 	}
 	_, err = c.Put(putRequest)
+	return err
+}
+
+func deleteKeyValue(c gohbase.Client, key, columnFamily string, value []byte,
+	options ...func(hrpc.Call) error) error {
+	values := map[string]map[string][]byte{columnFamily: map[string][]byte{}}
+	values[columnFamily]["a"] = value
+	d, err := hrpc.NewDel(context.Background(), []byte(table), []byte(key), values)
+	if err != nil {
+		return err
+	}
+	_, err = c.Delete(d)
 	return err
 }
 
@@ -2091,4 +1976,234 @@ func TestReverseScan(t *testing.T) {
 	}
 	results.Close()
 
+}
+
+func TestListTableNames(t *testing.T) {
+	// Initialize our tables
+	ac := gohbase.NewAdminClient(*host)
+	tables := []string{
+		table + "_MATCH1",
+		table + "_MATCH2",
+		table + "nomatch",
+	}
+
+	for _, tn := range tables {
+		// Since this test is called by TestMain which waits for hbase init
+		// there is no need to wait here.
+		err := CreateTable(ac, tn, []string{"cf"})
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	defer func() {
+		for _, tn := range tables {
+			err := DeleteTable(ac, tn)
+			if err != nil {
+				panic(err)
+			}
+		}
+	}()
+
+	m1 := []byte(table + "_MATCH1")
+	m2 := []byte(table + "_MATCH2")
+	tcases := []struct {
+		desc      string
+		regex     string
+		namespace string
+		sys       bool
+
+		match []*pb.TableName
+	}{
+		{
+			desc:  "match all",
+			regex: ".*",
+			match: []*pb.TableName{
+				&pb.TableName{Qualifier: []byte(table)},
+				&pb.TableName{Qualifier: m1},
+				&pb.TableName{Qualifier: m2},
+				&pb.TableName{Qualifier: []byte(table + "nomatch")},
+			},
+		},
+		{
+			desc:  "match_some",
+			regex: ".*_MATCH.*",
+			match: []*pb.TableName{
+				&pb.TableName{Qualifier: m1},
+				&pb.TableName{Qualifier: m2},
+			},
+		},
+		{
+			desc: "match_none",
+		},
+		{
+			desc:      "match meta",
+			regex:     ".*meta.*",
+			namespace: "hbase",
+			sys:       true,
+			match: []*pb.TableName{
+				&pb.TableName{Qualifier: []byte("meta")},
+			},
+		},
+	}
+
+	for _, tcase := range tcases {
+		t.Run(tcase.desc, func(t *testing.T) {
+			tn, err := hrpc.NewListTableNames(
+				context.Background(),
+				hrpc.ListRegex(tcase.regex),
+				hrpc.ListSysTables(tcase.sys),
+				hrpc.ListNamespace(tcase.namespace),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			names, err := ac.ListTableNames(tn)
+			if err != nil {
+				t.Error(err)
+			}
+
+			// filter to have only tables that we've created
+			var got []*pb.TableName
+			for _, m := range names {
+				if strings.HasPrefix(string(m.Qualifier), table) ||
+					string(m.Namespace) == "hbase" {
+					got = append(got, m)
+				}
+			}
+
+			if len(got) != len(tcase.match) {
+				t.Errorf("expected %v, got %v", tcase.match, got)
+			}
+
+			for i, m := range tcase.match {
+				want := string(m.Qualifier)
+				got := string(tcase.match[i].Qualifier)
+				if want != got {
+					t.Errorf("index %d: expected: %v, got %v", i, want, got)
+				}
+			}
+		})
+	}
+
+}
+
+// Test snapshot creation
+func TestSnapshot(t *testing.T) {
+	ac := gohbase.NewAdminClient(*host)
+
+	name := "snapshot-" + table
+
+	sn, err := hrpc.NewSnapshot(context.Background(), name, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = ac.CreateSnapshot(sn); err != nil {
+		t.Error(err)
+	}
+
+	defer func() {
+		if err = ac.DeleteSnapshot(sn); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	ls := hrpc.NewListSnapshots(context.Background())
+	snaps, err := ac.ListSnapshots(ls)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if len(snaps) != 1 {
+		t.Errorf("expection 1 snapshot, got %v", len(snaps))
+	}
+
+	gotName := snaps[0].GetName()
+	if gotName != name {
+		t.Errorf("expection snapshot name to be %v got %v", name, gotName)
+	}
+}
+
+// Test snapshot restoration
+func TestRestoreSnapshot(t *testing.T) {
+	// Prochedure for this test is roughly:
+	// - Create some data in a table.
+	// - Create a snapshot.
+	// - Remove all data.
+	// - Restore snapshot.
+	// - Ensure data is there.
+
+	var (
+		key  = t.Name() + "_Get"
+		name = "snapshot-" + table
+	)
+
+	c := gohbase.NewClient(*host, gohbase.RpcQueueSize(1))
+	if err := insertKeyValue(c, key, "cf", []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+
+	ac := gohbase.NewAdminClient(*host)
+
+	sn, err := hrpc.NewSnapshot(context.Background(), name, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ac.CreateSnapshot(sn); err != nil {
+		t.Error(err)
+	}
+
+	defer func() {
+		err = ac.DeleteSnapshot(sn)
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+
+	if err := deleteKeyValue(c, key, "cf", []byte{1}); err != nil {
+		t.Error(err)
+	}
+
+	g, err := hrpc.NewGetStr(context.Background(), table, key)
+	if err != nil {
+		t.Error(err)
+	}
+
+	r, err := c.Get(g)
+	if err != nil {
+		t.Error(err)
+	}
+
+	if len(r.Cells) != 0 {
+		t.Fatalf("expected no cells in table %s key %s", table, key)
+	}
+
+	c.Close()
+
+	td := hrpc.NewDisableTable(context.Background(), []byte(table))
+	if err := ac.DisableTable(td); err != nil {
+		t.Error(err)
+	}
+
+	if err = ac.RestoreSnapshot(sn); err != nil {
+		t.Error(err)
+	}
+
+	te := hrpc.NewEnableTable(context.Background(), []byte(table))
+	if err := ac.EnableTable(te); err != nil {
+		t.Error(err)
+	}
+
+	c = gohbase.NewClient(*host, gohbase.RpcQueueSize(1))
+
+	r, err = c.Get(g)
+	if err != nil {
+		t.Error(err)
+	}
+
+	expV := []byte{1}
+	if !bytes.Equal(r.Cells[0].Value, expV) {
+		t.Errorf("expected %v, got %v:", expV, r.Cells[0].Value)
+	}
 }

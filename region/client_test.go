@@ -12,25 +12,27 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"reflect"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	atest "github.com/aristanetworks/goarista/test"
 	"github.com/golang/mock/gomock"
-	"github.com/golang/protobuf/proto"
-	"github.com/reborn-go/gohbase/hrpc"
-	"github.com/reborn-go/gohbase/pb"
-	"github.com/reborn-go/gohbase/test"
-	"github.com/reborn-go/gohbase/test/mock"
+	"github.com/tsuna/gohbase/hrpc"
+	"github.com/tsuna/gohbase/pb"
+	"github.com/tsuna/gohbase/test"
+	"github.com/tsuna/gohbase/test/mock"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestErrors(t *testing.T) {
-	ue := UnrecoverableError{fmt.Errorf("oops")}
-	if ue.Error() != "oops" {
-		t.Errorf("Wrong error message. Got %q, wanted %q", ue, "oops")
+	ue := ServerError{fmt.Errorf("oops")}
+	if ue.Error() != "region.ServerError: oops" {
+		t.Errorf("Wrong error message. Got %q, wanted %q", ue, "region.ServerError: oops")
 	}
 }
 
@@ -46,17 +48,15 @@ func TestWrite(t *testing.T) {
 	expectErr := errors.New("nope")
 	mockConn.EXPECT().Write(gomock.Any()).Return(0, expectErr).Times(1)
 	err := c.write([]byte("lol"))
-	if diff := atest.Diff(expectErr, err); diff != "" {
-		t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-			expectErr, err, diff)
+	if err != expectErr {
+		t.Errorf("expected %v, got %v", expectErr, err)
 	}
 
 	// check if it actually writes the right data
 	expected := []byte("lol")
 	mockConn.EXPECT().Write(gomock.Any()).Return(3, nil).Times(1).Do(func(buf []byte) {
-		if diff := atest.Diff(expected, buf); diff != "" {
-			t.Errorf("Expected: %#v\nReceived: %#v\nDiff:%s",
-				expected, buf, diff)
+		if !bytes.Equal(expected, buf) {
+			t.Errorf("expected %v, got %v", expected, buf)
 		}
 	})
 	err = c.write(expected)
@@ -72,32 +72,32 @@ func TestSendHello(t *testing.T) {
 	c := &client{
 		conn:          mockConn,
 		effectiveUser: "root",
+		ctype:         RegionClient,
 	}
 
 	// check if it's sending the right "hello" for RegionClient
 	mockConn.EXPECT().Write(gomock.Any()).Return(78, nil).Times(1).Do(func(buf []byte) {
 		expected := []byte("HBas\x00P\x00\x00\x00D\n\x06\n\x04root\x12\rClientService\x1a+" +
 			"org.apache.hadoop.hbase.codec.KeyValueCodec")
-		if diff := atest.Diff(expected, buf); diff != "" {
-			t.Errorf("Type RegionClient:\n Expected: %#v\nReceived: %#v\nDiff:%s",
-				expected, buf, diff)
+		if !bytes.Equal(expected, buf) {
+			t.Errorf("expected %v, got %v", expected, buf)
 		}
 	})
-	err := c.sendHello(RegionClient)
+	err := c.sendHello()
 	if err != nil {
 		t.Errorf("Wasn't expecting error, but got one: %#v", err)
 	}
 
 	// check if it sends the right "hello" for MasterClient
+	c.ctype = MasterClient
 	mockConn.EXPECT().Write(gomock.Any()).Return(78, nil).Times(1).Do(func(buf []byte) {
 		expected := []byte("HBas\x00P\x00\x00\x00D\n\x06\n\x04root\x12\rMasterService\x1a+" +
 			"org.apache.hadoop.hbase.codec.KeyValueCodec")
-		if diff := atest.Diff(expected, buf); diff != "" {
-			t.Errorf("Type MasterClient:\n Expected: %#v\nReceived: %#v\nDiff:%s",
-				expected, buf, diff)
+		if !bytes.Equal(expected, buf) {
+			t.Errorf("expected %v, got %v", expected, buf)
 		}
 	})
-	err = c.sendHello(MasterClient)
+	err = c.sendHello()
 	if err != nil {
 		t.Errorf("Was expecting error, but got one: %#v", err)
 	}
@@ -139,6 +139,14 @@ func TestFail(t *testing.T) {
 			t.Error("expected done to be closed")
 		}
 	}
+
+	// check that failing undialed client doesn't panic
+	c = &client{
+		done: make(chan struct{}),
+		rpcs: make(chan hrpc.Call),
+		sent: make(map[uint32]hrpc.Call),
+	}
+	c.fail(expectedErr)
 }
 
 type mc struct {
@@ -276,8 +284,8 @@ func TestProcessRPCsWithFail(t *testing.T) {
 	// check that all calls are not stuck and get an error
 	for _, call := range calls {
 		r := <-call.ResultChan()
-		if r.Error != ErrClientDead {
-			t.Errorf("got unexpected error %v, expected %v", r.Error, ErrClientDead)
+		if r.Error != ErrClientClosed {
+			t.Errorf("got unexpected error %v, expected %v", r.Error, ErrClientClosed)
 		}
 	}
 
@@ -293,11 +301,13 @@ func mockRPCProto(row string) (proto.Message, []byte) {
 	get := &pb.GetRequest{Region: r, Get: &pb.Get{Row: []byte(row)}}
 
 	var b []byte
-	buf := proto.NewBuffer(b)
-	if err := buf.EncodeMessage(get); err != nil {
+	var err error
+	b = protowire.AppendVarint(b, uint64(proto.Size(get)))
+	b, err = proto.MarshalOptions{}.MarshalAppend(b, get)
+	if err != nil {
 		panic(err)
 	}
-	return get, buf.Bytes()
+	return get, b
 }
 
 func TestQueueRPC(t *testing.T) {
@@ -371,14 +381,13 @@ func TestQueueRPC(t *testing.T) {
 			mockCall.EXPECT().ResultChan().Return(result).Times(1)
 			c.QueueRPC(mockCall)
 			r := <-result
-			err, ok := r.Error.(UnrecoverableError)
+			err, ok := r.Error.(ServerError)
 			if !ok {
-				t.Errorf("Expected UnrecoverableError error")
+				t.Errorf("Expected ServerError error")
 				return
 			}
-			if diff := atest.Diff(ErrClientDead.error, err.error); diff != "" {
-				t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-					ErrClientDead.error, err.error, diff)
+			if ErrClientClosed != err {
+				t.Errorf("expected %v, got %v", ErrClientClosed, err)
 			}
 		}()
 	}
@@ -386,7 +395,7 @@ func TestQueueRPC(t *testing.T) {
 	wgProcessRPCs.Wait()
 }
 
-func TestUnrecoverableErrorWrite(t *testing.T) {
+func TestServerErrorWrite(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
@@ -418,16 +427,15 @@ func TestUnrecoverableErrorWrite(t *testing.T) {
 	// check that processRPCs exists
 	c.processRPCs()
 	r := <-result
-	if diff := atest.Diff(ErrClientDead.Error(), r.Error.Error()); diff != "" {
-		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-			expErr, r.Error, diff)
+	if ErrClientClosed != r.Error {
+		t.Errorf("expected %v, got %v", ErrClientClosed, r.Error)
 	}
 	if len(c.sent) != 0 {
 		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
 	}
 }
 
-func TestUnrecoverableErrorRead(t *testing.T) {
+func TestServerErrorRead(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 
@@ -463,13 +471,12 @@ func TestUnrecoverableErrorRead(t *testing.T) {
 		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
 	}
 	r := <-result
-	if diff := atest.Diff(ErrClientDead.Error(), r.Error.Error()); diff != "" {
-		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-			ErrClientDead, r.Error, diff)
+	if ErrClientClosed != r.Error {
+		t.Errorf("expected %v, got %v", ErrClientClosed, r.Error)
 	}
 }
 
-func TestUnrecoverableExceptionResponse(t *testing.T) {
+func TestServerErrorExceptionResponse(t *testing.T) {
 	ctrl := test.NewController(t)
 	defer ctrl.Finish()
 	mockConn := mock.NewMockConn(ctrl)
@@ -489,24 +496,25 @@ func TestUnrecoverableExceptionResponse(t *testing.T) {
 	}
 
 	c.registerRPC(rpc)
-	c.inFlightUp()
+	if err := c.inFlightUp(); err != nil {
+		t.Fatal(err)
+	}
 
 	var response []byte
-	b := proto.NewBuffer(response)
-
-	err = b.EncodeMessage(&pb.ResponseHeader{
+	header := &pb.ResponseHeader{
 		CallId: proto.Uint32(1),
 		Exception: &pb.ExceptionResponse{
 			ExceptionClassName: proto.String(
 				"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException"),
 			StackTrace: proto.String("ooops"),
 		},
-	})
+	}
+
+	response = protowire.AppendVarint(response, uint64(proto.Size(header)))
+	response, err = proto.MarshalOptions{}.MarshalAppend(response, header)
 	if err != nil {
 		t.Fatal(err)
 	}
-
-	response = b.Bytes()
 
 	mockConn.EXPECT().Read(readBufSizeMatcher{l: 4}).Times(1).Return(4, nil).
 		Do(func(buf []byte) { binary.BigEndian.PutUint32(buf, uint32(len(response))) })
@@ -518,15 +526,50 @@ func TestUnrecoverableExceptionResponse(t *testing.T) {
 		"org.apache.hadoop.hbase.regionserver.RegionServerAbortedException", "ooops")
 
 	err = c.receive()
-	if _, ok := err.(UnrecoverableError); !ok {
+	if _, ok := err.(ServerError); !ok {
 		if err.Error() != expErr.Error() {
-			t.Fatalf("expected UnrecoverableError with message %q, got %T: %v", expErr, err, err)
+			t.Fatalf("expected ServerError with message %q, got %T: %v", expErr, err, err)
 		}
 	}
 
 	re := <-rpc.ResultChan()
 	if re.Error != err {
 		t.Errorf("expected error %v, got %v", err, re.Error)
+	}
+}
+
+func TestExceptionToError(t *testing.T) {
+	tcases := []struct {
+		class string
+		stack string
+		out   error
+	}{
+		{
+			class: "java.io.IOException",
+			stack: "ooops",
+			out:   errors.New("HBase Java exception java.io.IOException:\nooops"),
+		},
+		{
+			class: "java.io.IOException",
+			stack: "Cannot append; log is closed\nblahblah",
+			out: NotServingRegionError{errors.New("HBase Java exception java.io.IOException:\n" +
+				"Cannot append; log is closed\nblahblah")},
+		},
+		{
+			class: "org.apache.hadoop.hbase.CallQueueTooBigException",
+			stack: "blahblah",
+			out: RetryableError{errors.New(
+				"HBase Java exception org.apache.hadoop.hbase.CallQueueTooBigException:\n" +
+					"blahblah")},
+		},
+	}
+	for _, tcase := range tcases {
+		t.Run(tcase.class, func(t *testing.T) {
+			err := exceptionToError(tcase.class, tcase.stack)
+			if !reflect.DeepEqual(err, tcase.out) {
+				t.Fatalf("expected error %q, got error %q", tcase.out, err)
+			}
+		})
 	}
 }
 
@@ -559,12 +602,11 @@ func TestReceiveDecodeProtobufError(t *testing.T) {
 	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
 		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
 	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
-	expError := errors.New(
-		"failed to decode the response: proto: pb.MutateResponse: illegal tag 0 (wire type 0)")
+	expErrorPefix := "region.RetryableError: failed to decode the response: proto:"
 
 	err := c.receive()
-	if err == nil || err.Error() != expError.Error() {
-		t.Errorf("Expected error %v, got %v", expError, err)
+	if err == nil || strings.HasPrefix(expErrorPefix, err.Error()) {
+		t.Errorf("Expected error prefix %v, got %v", expErrorPefix, err)
 	}
 
 	res := <-result
@@ -608,7 +650,7 @@ func TestReceiveDeserializeCellblocksError(t *testing.T) {
 	mockConn.EXPECT().Read(readBufSizeMatcher{l: len(response)}).Times(1).
 		Return(len(response), nil).Do(func(buf []byte) { copy(buf, response) })
 	mockConn.EXPECT().SetReadDeadline(time.Time{}).Times(1)
-	expError := errors.New("failed to decode the response: OOPS")
+	expError := errors.New("region.RetryableError: failed to decode the response: OOPS")
 
 	err := c.receive()
 	if err == nil || err.Error() != expError.Error() {
@@ -647,10 +689,9 @@ func TestUnexpectedSendError(t *testing.T) {
 
 	c.QueueRPC(mockCall)
 	r := <-result
-	err := errors.New("failed to marshal request: proto: Marshal called with nil")
-	if diff := atest.Diff(err, r.Error); diff != "" {
-		t.Errorf("Expected: %s\nReceived: %s\nDiff:%s",
-			err, r.Error, diff)
+	expectedErr := "failed to marshal request: proto: Marshal called with nil"
+	if err := r.Error; err == nil || err.Error() != expectedErr {
+		t.Errorf("expected %q, got %v", expectedErr, err)
 	}
 	if len(c.sent) != 0 {
 		t.Errorf("Expected all awaiting rpcs to be processed, %d left", len(c.sent))
@@ -889,8 +930,8 @@ func TestSanity(t *testing.T) {
 			},
 		},
 	}
-	if d := atest.Diff(expResult, r.Result); len(d) != 0 {
-		t.Error(d)
+	if !proto.Equal(expResult, r.Result) {
+		t.Errorf("expected %v, got %v", expResult, r.Result)
 	}
 	if int(c.inFlight) != 0 {
 		t.Errorf("expected %d in-flight rpcs, got %d", 0, c.inFlight)
@@ -962,7 +1003,9 @@ func BenchmarkSetReadDeadline(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		conn.SetReadDeadline(time.Now().Add(DefaultReadTimeout))
+		if err := conn.SetReadDeadline(time.Now().Add(DefaultReadTimeout)); err != nil {
+			b.Fatal(err)
+		}
 	}
 	b.StopTimer()
 

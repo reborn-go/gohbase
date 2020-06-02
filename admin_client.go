@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
@@ -17,13 +18,24 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	// snapshotValidateInterval specifies the amount of time to wait before
+	// polling the hbase server about the status of a snapshot operation.
+	snaphotValidateInterval time.Duration = time.Second / 2
+)
+
 // AdminClient to perform admistrative operations with HMaster
 type AdminClient interface {
 	CreateTable(t *hrpc.CreateTable) error
 	DeleteTable(t *hrpc.DeleteTable) error
 	EnableTable(t *hrpc.EnableTable) error
 	DisableTable(t *hrpc.DisableTable) error
+	CreateSnapshot(t *hrpc.Snapshot) error
+	DeleteSnapshot(t *hrpc.Snapshot) error
+	ListSnapshots(t *hrpc.ListSnapshots) ([]*pb.SnapshotDescription, error)
+	RestoreSnapshot(t *hrpc.Snapshot) error
 	ClusterStatus() (*pb.ClusterStatus, error)
+	ListTableNames(t *hrpc.ListTableNames) ([]*pb.TableName, error)
 }
 
 // NewAdminClient creates an admin HBase client.
@@ -36,7 +48,7 @@ func newAdminClient(zkquorum string, options ...Option) AdminClient {
 		"Host": zkquorum,
 	}).Debug("Creating new admin client.")
 	c := &client{
-		clientType:    adminClient,
+		clientType:    region.MasterClient,
 		rpcQueueSize:  defaultRPCQueueSize,
 		flushInterval: defaultFlushInterval,
 		// empty region in order to be able to set client to it
@@ -46,6 +58,7 @@ func newAdminClient(zkquorum string, options ...Option) AdminClient {
 		effectiveUser:       defaultEffectiveUser,
 		regionLookupTimeout: region.DefaultLookupTimeout,
 		regionReadTimeout:   region.DefaultReadTimeout,
+		newRegionClientFn:   region.NewClient,
 	}
 	for _, option := range options {
 		option(c)
@@ -153,4 +166,105 @@ func (c *client) checkProcedureWithBackoff(ctx context.Context, procID uint64) e
 			}
 		}
 	}
+}
+
+// CreateSnapshot creates a snapshot in HBase.
+//
+// If a context happens during creation, no cleanup is done.
+func (c *client) CreateSnapshot(t *hrpc.Snapshot) error {
+
+	pbmsg, err := c.SendRPC(t)
+	if err != nil {
+		return err
+	}
+
+	_, ok := pbmsg.(*pb.SnapshotResponse)
+	if !ok {
+		return errors.New("sendPRC returned not a SnapshotResponse")
+	}
+
+	ticker := time.NewTicker(snaphotValidateInterval)
+	defer ticker.Stop()
+	check := hrpc.NewSnapshotDone(t)
+	ctx := t.Context()
+
+	for {
+		select {
+		case <-ticker.C:
+			pbmsgs, err := c.SendRPC(check)
+			if err != nil {
+				return err
+			}
+
+			r, ok := pbmsgs.(*pb.IsSnapshotDoneResponse)
+			if !ok {
+				return errors.New("sendPRC returned not a IsSnapshotDoneResponse")
+			}
+
+			if r.GetDone() {
+				return nil
+			}
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// DeleteSnapshot deletes a snapshot in HBase.
+func (c *client) DeleteSnapshot(t *hrpc.Snapshot) error {
+	rt := hrpc.NewDeleteSnapshot(t)
+	pbmsg, err := c.SendRPC(rt)
+	if err != nil {
+		return err
+	}
+
+	_, ok := pbmsg.(*pb.DeleteSnapshotResponse)
+	if !ok {
+		return errors.New("sendPRC returned not a DeleteSnapshotResponse")
+	}
+
+	return nil
+}
+
+func (c *client) ListSnapshots(t *hrpc.ListSnapshots) ([]*pb.SnapshotDescription, error) {
+	pbmsg, err := c.SendRPC(t)
+	if err != nil {
+		return nil, err
+	}
+
+	r, ok := pbmsg.(*pb.GetCompletedSnapshotsResponse)
+	if !ok {
+		return nil, errors.New("sendPRC returned not a GetCompletedSnapshotsResponse")
+	}
+
+	return r.GetSnapshots(), nil
+
+}
+
+func (c *client) RestoreSnapshot(t *hrpc.Snapshot) error {
+	rt := hrpc.NewRestoreSnapshot(t)
+	pbmsg, err := c.SendRPC(rt)
+	if err != nil {
+		return err
+	}
+
+	_, ok := pbmsg.(*pb.RestoreSnapshotResponse)
+	if !ok {
+		return errors.New("sendPRC returned not a RestoreSnapshotResponse")
+	}
+	return nil
+}
+
+func (c *client) ListTableNames(t *hrpc.ListTableNames) ([]*pb.TableName, error) {
+	pbmsg, err := c.SendRPC(t)
+	if err != nil {
+		return nil, err
+	}
+
+	res, ok := pbmsg.(*pb.GetTableNamesResponse)
+	if !ok {
+		return nil, errors.New("sendPRC returned not a GetTableNamesResponse")
+	}
+
+	return res.GetTableNames(), nil
 }

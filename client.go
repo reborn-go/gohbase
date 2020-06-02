@@ -11,28 +11,21 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cznic/b"
-	"github.com/golang/protobuf/proto"
-	"github.com/reborn-go/gohbase/hrpc"
-	"github.com/reborn-go/gohbase/pb"
-	"github.com/reborn-go/gohbase/region"
-	"github.com/reborn-go/gohbase/zk"
 	log "github.com/sirupsen/logrus"
-	"golang.org/x/time/rate"
+	"github.com/tsuna/gohbase/hrpc"
+	"github.com/tsuna/gohbase/pb"
+	"github.com/tsuna/gohbase/region"
+	"github.com/tsuna/gohbase/zk"
+	"google.golang.org/protobuf/proto"
+	"modernc.org/b"
 )
 
 const (
-	standardClient = iota
-	adminClient
 	defaultRPCQueueSize  = 100
 	defaultFlushInterval = 20 * time.Millisecond
 	defaultZkRoot        = "/hbase"
 	defaultZkTimeout     = 30 * time.Second
 	defaultEffectiveUser = "root"
-	// metaBurst is maximum number of request allowed at once.
-	metaBurst = 10
-	// metaLimit is rate at which to throttle requests to hbase:meta table.
-	metaLimit = rate.Limit(100)
 )
 
 // Client a regular HBase client
@@ -43,7 +36,6 @@ type Client interface {
 	Delete(d *hrpc.Mutate) (*hrpc.Result, error)
 	Append(a *hrpc.Mutate) (*hrpc.Result, error)
 	Increment(i *hrpc.Mutate) (int64, error)
-	IncrementMultiColumn(i *hrpc.Mutate) (*hrpc.Result, error)
 	CheckAndPut(p *hrpc.Mutate, family string, qualifier string,
 		expectedValue []byte) (bool, error)
 	Close()
@@ -59,7 +51,7 @@ type Option func(*client)
 
 // A Client provides access to an HBase cluster.
 type client struct {
-	clientType int
+	clientType region.ClientType
 
 	regions keyRegionCache
 
@@ -89,9 +81,6 @@ type client struct {
 	// The user used when accessing regions.
 	effectiveUser string
 
-	// metaLookupLimiter is used to throttle lookups to hbase:meta table
-	metaLookupLimiter *rate.Limiter
-
 	// How long to wait for a region lookup (either meta lookup or finding
 	// meta in ZooKeeper).  Should be greater than or equal to the ZooKeeper
 	// session timeout.
@@ -102,6 +91,9 @@ type client struct {
 
 	done      chan struct{}
 	closeOnce sync.Once
+
+	newRegionClientFn func(string, region.ClientType, int, time.Duration,
+		string, time.Duration) hrpc.RegionClient
 }
 
 // NewClient creates a new HBase client.
@@ -114,7 +106,7 @@ func newClient(zkquorum string, options ...Option) *client {
 		"Host": zkquorum,
 	}).Debug("Creating new client.")
 	c := &client{
-		clientType: standardClient,
+		clientType: region.RegionClient,
 		regions:    keyRegionCache{regions: b.TreeNew(region.CompareGeneric)},
 		clients: clientRegionCache{
 			regions: make(map[hrpc.RegionClient]map[hrpc.RegionInfo]struct{}),
@@ -131,10 +123,10 @@ func newClient(zkquorum string, options ...Option) *client {
 		zkRoot:              defaultZkRoot,
 		zkTimeout:           defaultZkTimeout,
 		effectiveUser:       defaultEffectiveUser,
-		metaLookupLimiter:   rate.NewLimiter(metaLimit, metaBurst),
 		regionLookupTimeout: region.DefaultLookupTimeout,
 		regionReadTimeout:   region.DefaultReadTimeout,
 		done:                make(chan struct{}),
+		newRegionClientFn:   region.NewClient,
 	}
 	for _, option := range options {
 		option(c)
@@ -202,7 +194,7 @@ func FlushInterval(interval time.Duration) Option {
 func (c *client) Close() {
 	c.closeOnce.Do(func() {
 		close(c.done)
-		if c.clientType == adminClient {
+		if c.clientType == region.MasterClient {
 			if ac := c.adminRegionInfo.Client(); ac != nil {
 				ac.Close()
 			}
@@ -254,14 +246,6 @@ func (c *client) Increment(i *hrpc.Mutate) (int64, error) {
 
 	val := binary.BigEndian.Uint64(r.Cells[0].Value)
 	return int64(val), nil
-}
-
-func (c *client) IncrementMultiColumn(i *hrpc.Mutate) (*hrpc.Result, error) {
-	r, err := c.mutate(i)
-	if err != nil {
-		return nil, err
-	}
-	return r, nil
 }
 
 func (c *client) mutate(m *hrpc.Mutate) (*hrpc.Result, error) {
