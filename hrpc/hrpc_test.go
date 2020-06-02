@@ -16,10 +16,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tsuna/gohbase/filter"
-	"github.com/tsuna/gohbase/pb"
-	"github.com/tsuna/gohbase/test"
-	"google.golang.org/protobuf/proto"
+	"github.com/golang/protobuf/proto"
+	"github.com/reborn-go/gohbase/filter"
+	"github.com/reborn-go/gohbase/pb"
+	"github.com/reborn-go/gohbase/test"
 )
 
 func TestNewGet(t *testing.T) {

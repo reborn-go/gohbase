@@ -11,8 +11,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/tsuna/gohbase/pb"
-	"google.golang.org/protobuf/proto"
+	"github.com/golang/protobuf/proto"
+	"github.com/reborn-go/gohbase/pb"
 )
 
 var attributeNameTTL = "_ttl"

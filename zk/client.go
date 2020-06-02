@@ -16,9 +16,9 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/golang/protobuf/proto"
+	"github.com/reborn-go/gohbase/pb"
 	"github.com/samuel/go-zookeeper/zk"
-	"github.com/tsuna/gohbase/pb"
-	"google.golang.org/protobuf/proto"
 )
 
 type logger struct{}

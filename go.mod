@@ -1,4 +1,4 @@
-module github.com/tsuna/gohbase
+module github.com/reborn-go/gohbase
 
 go 1.13
 

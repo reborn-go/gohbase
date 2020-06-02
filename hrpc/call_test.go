@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/tsuna/gohbase/pb"
-	"google.golang.org/protobuf/proto"
+	"github.com/golang/protobuf/proto"
+	"github.com/reborn-go/gohbase/pb"
 )
 
 func TestCellFromCellBlock(t *testing.T) {
