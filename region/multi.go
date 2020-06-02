@@ -11,9 +11,9 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 var multiPool = sync.Pool{

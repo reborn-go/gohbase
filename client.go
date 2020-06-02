@@ -11,12 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
 	"github.com/reborn-go/gohbase/region"
 	"github.com/reborn-go/gohbase/zk"
 	log "github.com/sirupsen/logrus"
+	"google.golang.org/protobuf/proto"
 	"modernc.org/b"
 )
 

@@ -13,10 +13,10 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
 	"github.com/reborn-go/gohbase/test"
+	"google.golang.org/protobuf/proto"
 )
 
 type RegionActions []*pb.RegionAction

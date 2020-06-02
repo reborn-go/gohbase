@@ -18,10 +18,10 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 // ClientType is a type alias to represent the type of this region client

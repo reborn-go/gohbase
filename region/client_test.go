@@ -21,12 +21,12 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
 	"github.com/reborn-go/gohbase/test"
 	"github.com/reborn-go/gohbase/test/mock"
 	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 )
 
 func TestErrors(t *testing.T) {

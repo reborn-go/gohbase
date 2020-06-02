@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/golang/mock/gomock"
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/hrpc"
 	"github.com/reborn-go/gohbase/pb"
 	"github.com/reborn-go/gohbase/region"
@@ -26,6 +25,7 @@ import (
 	mockRegion "github.com/reborn-go/gohbase/test/mock/region"
 	mockZk "github.com/reborn-go/gohbase/test/mock/zk"
 	"github.com/reborn-go/gohbase/zk"
+	"google.golang.org/protobuf/proto"
 	"modernc.org/b"
 )
 

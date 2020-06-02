@@ -12,8 +12,8 @@ import (
 	"fmt"
 	"unsafe"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 // RegionInfo represents HBase region.

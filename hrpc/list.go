@@ -4,8 +4,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/golang/protobuf/proto"
 	"github.com/reborn-go/gohbase/pb"
+	"google.golang.org/protobuf/proto"
 )
 
 // ListTableNames models a ListTableNames pb call
